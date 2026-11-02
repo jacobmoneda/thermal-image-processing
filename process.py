@@ -1,504 +1,924 @@
-#!/usr/bin/env python3
-"""
-process.py - Batch-process original UNI-T UTi260E JPGs.
-
-Usage:
-    python process.py image.jpg
-    python process.py path/to/folder
-
-Outputs:
-    outputs/
-    ├── temperature_csv/
-    │   └── <name>_temperature.csv
-    ├── heatmaps/
-    │   └── <name>_heatmap.png
-    ├── summaries/
-    │   └── <name>_summary.csv
-    └── inspection_summary.csv
-
-Dependencies:
-    pip install numpy matplotlib
-
-Important:
-    Use original JPG files copied directly from the UTi260E / SD card.
-    Re-saving an image in another application may remove the embedded
-    radiometric payload.
-"""
-
+from pathlib import Path
 import argparse
 import csv
-import sys
-from pathlib import Path
+import struct
 
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 
 
-WIDTH = 256
-HEIGHT = 192
-PIXEL_COUNT = WIDTH * HEIGHT
-BYTES_PER_PIXEL_RECORD = 8
-THERMAL_BYTES = PIXEL_COUNT * BYTES_PER_PIXEL_RECORD
-PAYLOAD_HEADER_BYTES = 4
+# ============================================================
+# UTi260E THERMAL CONSTANTS
+# ============================================================
+
+THERMAL_WIDTH = 256
+THERMAL_HEIGHT = 192
+
+THERMAL_PIXELS = THERMAL_WIDTH * THERMAL_HEIGHT
+
+# Each thermal pixel record is:
+#   4 bytes -> big-endian float32 temperature
+#   4 bytes -> auxiliary data
+THERMAL_RECORD_SIZE = 8
+
+THERMAL_BLOCK_SIZE = (
+    THERMAL_PIXELS
+    * THERMAL_RECORD_SIZE
+)
 
 
-def extract_temperature_matrix(image_path: Path) -> np.ndarray:
-    """Return the UTi260E 192x256 temperature matrix in degrees Celsius."""
+# ============================================================
+# OUTPUT DIRECTORIES
+# ============================================================
+
+def create_output_dirs(output_dir: Path) -> dict:
+    """
+    Create the output directory structure for one inspection.
+    """
+
+    dirs = {
+        "root":
+            output_dir,
+
+        "temperature_csv":
+            output_dir
+            / "temperature_csv",
+
+        "heatmaps":
+            output_dir
+            / "heatmaps",
+
+        "rgb_images":
+            output_dir
+            / "rgb_images",
+
+        "summaries":
+            output_dir
+            / "summaries",
+    }
+
+    for directory in dirs.values():
+        directory.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+    return dirs
+
+
+# ============================================================
+# INPUT FILE COLLECTION
+# ============================================================
+
+def collect_input_files(input_path: Path):
+    """
+    Return UTi260E JPG files from either:
+      - one JPG file
+      - a folder of JPG files
+    """
+
+    if input_path.is_file():
+
+        if input_path.suffix.lower() not in [
+            ".jpg",
+            ".jpeg"
+        ]:
+            raise ValueError(
+                "Input file must be JPG/JPEG."
+            )
+
+        return [input_path]
+
+    if input_path.is_dir():
+
+        files = sorted([
+            path
+            for path in input_path.iterdir()
+            if path.is_file()
+            and path.suffix.lower()
+            in [".jpg", ".jpeg"]
+        ])
+
+        if not files:
+            raise FileNotFoundError(
+                f"No JPG files found in {input_path}"
+            )
+
+        return files
+
+    raise FileNotFoundError(
+        f"Input does not exist: {input_path}"
+    )
+
+
+# ============================================================
+# EMBEDDED JPEG EXTRACTION
+# ============================================================
+
+def extract_embedded_jpegs(
+    image_path: Path
+):
+    """
+    Extract all complete JPEG streams embedded inside
+    the UTi260E image file.
+
+    UTi260E files observed in this project contain
+    multiple JPEG streams.
+
+    Returns:
+        list of JPEG byte strings
+    """
+
     data = image_path.read_bytes()
 
-    if len(data) < 2 or data[:2] != b"\xff\xd8":
-        raise ValueError("Input does not appear to be a JPEG file.")
+    jpeg_start = b"\xff\xd8"
+    jpeg_end = b"\xff\xd9"
 
-    # Tested UTi260E files contain more than one JPEG section.
-    # The thermal payload follows the final JPEG EOI marker.
-    jpeg_end = data.rfind(b"\xff\xd9")
-    if jpeg_end == -1:
-        raise ValueError("Could not find JPEG end marker (FFD9).")
+    images = []
 
-    thermal_start = jpeg_end + 2 + PAYLOAD_HEADER_BYTES
-    thermal_end = thermal_start + THERMAL_BYTES
+    search_position = 0
+
+    while True:
+
+        start = data.find(
+            jpeg_start,
+            search_position
+        )
+
+        if start == -1:
+            break
+
+        end = data.find(
+            jpeg_end,
+            start + 2
+        )
+
+        if end == -1:
+            break
+
+        end += 2
+
+        images.append(
+            data[start:end]
+        )
+
+        search_position = end
+
+    return images
+
+
+# ============================================================
+# RGB EXTRACTION
+# ============================================================
+
+def save_rgb_image(
+    image_path: Path,
+    dirs: dict
+):
+    """
+    Extract the embedded visible-light image.
+
+    Based on the UTi260E files tested:
+        JPEG 1 = rendered thermal image
+        JPEG 2 = RGB / visible-light image
+
+    Returns:
+        Path to RGB JPG or None.
+    """
+
+    embedded_images = (
+        extract_embedded_jpegs(
+            image_path
+        )
+    )
+
+    if len(embedded_images) < 2:
+
+        print(
+            f"  RGB image not found: "
+            f"{image_path.name}"
+        )
+
+        return None
+
+    rgb_data = embedded_images[1]
+
+    output_path = (
+        dirs["rgb_images"]
+        / f"{image_path.stem}_rgb.jpg"
+    )
+
+    output_path.write_bytes(
+        rgb_data
+    )
+
+    return output_path
+
+
+# ============================================================
+# THERMAL PAYLOAD LOCATION
+# ============================================================
+
+def find_final_jpeg_end(
+    data: bytes
+):
+    """
+    Find the final JPEG EOI marker FF D9.
+
+    The radiometric block begins after the final
+    embedded JPEG plus four additional bytes.
+    """
+
+    marker = b"\xff\xd9"
+
+    position = data.rfind(marker)
+
+    if position == -1:
+        raise ValueError(
+            "Could not find final JPEG EOI marker."
+        )
+
+    return position + 2
+
+
+# ============================================================
+# TEMPERATURE EXTRACTION
+# ============================================================
+
+def extract_temperature_matrix(
+    image_path: Path
+):
+    """
+    Extract the 256 x 192 radiometric temperature
+    matrix from an original UTi260E JPG.
+
+    File structure observed:
+
+        [JPEG data]
+        FF D9
+        [4 bytes]
+        [thermal records]
+
+    Each thermal record:
+        bytes 0-3 -> big-endian float32 temperature °C
+        bytes 4-7 -> auxiliary data
+
+    Returns:
+        numpy array shape (192, 256)
+    """
+
+    data = image_path.read_bytes()
+
+    jpeg_end = find_final_jpeg_end(
+        data
+    )
+
+    # Radiometric data begins four bytes
+    # after the final JPEG.
+    thermal_start = (
+        jpeg_end + 4
+    )
+
+    thermal_end = (
+        thermal_start
+        + THERMAL_BLOCK_SIZE
+    )
 
     if thermal_end > len(data):
-        available = max(0, len(data) - thermal_start)
-        raise ValueError(
-            "Not enough data for a UTi260E "
-            f"{WIDTH}x{HEIGHT} thermal payload. "
-            f"Expected {THERMAL_BYTES} bytes, found {available}."
+
+        available = (
+            len(data)
+            - thermal_start
         )
 
-    thermal_block = data[thermal_start:thermal_end]
-
-    # Observed record format:
-    #   bytes 0..3 : big-endian float32 temperature in degC
-    #   bytes 4..7 : auxiliary value
-    record_dtype = np.dtype([
-        ("temperature", ">f4"),
-        ("aux", ">u4"),
-    ])
-
-    records = np.frombuffer(
-        thermal_block,
-        dtype=record_dtype,
-        count=PIXEL_COUNT,
-    )
-
-    matrix = (
-        records["temperature"]
-        .astype(np.float32)
-        .reshape((HEIGHT, WIDTH))
-    )
-
-    if not np.all(np.isfinite(matrix)):
         raise ValueError(
-            "Decoded matrix contains NaN/Inf values. "
-            "This file may use a different payload format."
+            f"Thermal payload too small. "
+            f"Expected {THERMAL_BLOCK_SIZE} bytes, "
+            f"found {available}."
         )
 
-    if matrix.min() < -300 or matrix.max() > 1000:
+    thermal_data = data[
+        thermal_start:
+        thermal_end
+    ]
+
+    temperatures = np.empty(
+        THERMAL_PIXELS,
+        dtype=np.float32
+    )
+
+    for index in range(
+        THERMAL_PIXELS
+    ):
+
+        offset = (
+            index
+            * THERMAL_RECORD_SIZE
+        )
+
+        temperature = struct.unpack(
+            ">f",
+            thermal_data[
+                offset:
+                offset + 4
+            ]
+        )[0]
+
+        temperatures[index] = (
+            temperature
+        )
+
+    matrix = temperatures.reshape(
+        (
+            THERMAL_HEIGHT,
+            THERMAL_WIDTH
+        )
+    )
+
+    # Basic sanity check.
+    if not np.all(
+        np.isfinite(matrix)
+    ):
+
         raise ValueError(
-            "Decoded temperatures are outside a plausible range. "
-            "This file may use a different UTi260E payload layout."
+            "Temperature matrix contains "
+            "invalid values."
         )
 
     return matrix
 
 
-def compute_stats(matrix: np.ndarray) -> dict:
-    min_y, min_x = np.unravel_index(np.argmin(matrix), matrix.shape)
-    max_y, max_x = np.unravel_index(np.argmax(matrix), matrix.shape)
+# ============================================================
+# STATISTICS
+# ============================================================
 
-    center_x = WIDTH // 2
-    center_y = HEIGHT // 2
+def calculate_statistics(
+    temperature: np.ndarray
+):
+    """
+    Calculate thermal statistics for one image.
+    """
+
+    min_index = np.unravel_index(
+        np.argmin(temperature),
+        temperature.shape
+    )
+
+    max_index = np.unravel_index(
+        np.argmax(temperature),
+        temperature.shape
+    )
+
+    min_y, min_x = min_index
+    max_y, max_x = max_index
+
+    center_x = (
+        THERMAL_WIDTH // 2
+    )
+
+    center_y = (
+        THERMAL_HEIGHT // 2
+    )
+
+    minimum = float(
+        temperature[min_y, min_x]
+    )
+
+    maximum = float(
+        temperature[max_y, max_x]
+    )
+
+    mean = float(
+        np.mean(temperature)
+    )
+
+    median = float(
+        np.median(temperature)
+    )
+
+    center = float(
+        temperature[
+            center_y,
+            center_x
+        ]
+    )
+
+    delta_max = (
+        maximum - median
+    )
 
     return {
-        "minimum_C": float(matrix[min_y, min_x]),
-        "minimum_x_px": int(min_x),
-        "minimum_y_px": int(min_y),
-        "maximum_C": float(matrix[max_y, max_x]),
-        "maximum_x_px": int(max_x),
-        "maximum_y_px": int(max_y),
-        "mean_C": float(matrix.mean()),
-        "center_C": float(matrix[center_y, center_x]),
-        "center_x_px": center_x,
-        "center_y_px": center_y,
+        "minimum_C":
+            minimum,
+
+        "minimum_x_px":
+            int(min_x),
+
+        "minimum_y_px":
+            int(min_y),
+
+        "maximum_C":
+            maximum,
+
+        "maximum_x_px":
+            int(max_x),
+
+        "maximum_y_px":
+            int(max_y),
+
+        "mean_C":
+            mean,
+
+        "median_C":
+            median,
+
+        "center_C":
+            center,
+
+        "delta_max_C":
+            delta_max,
+
+        "center_x_px":
+            center_x,
+
+        "center_y_px":
+            center_y,
     }
 
 
-def write_temperature_csv(matrix: np.ndarray, output_path: Path) -> None:
+# ============================================================
+# SAVE TEMPERATURE CSV
+# ============================================================
+
+def save_temperature_csv(
+    temperature: np.ndarray,
+    output_path: Path
+):
+    """
+    Save all 49,152 thermal temperatures as CSV.
+    """
+
     np.savetxt(
         output_path,
-        matrix,
+        temperature,
         delimiter=",",
-        fmt="%.4f",
+        fmt="%.4f"
     )
 
 
-def write_summary_csv(
-    stats: dict,
+# ============================================================
+# SAVE HEATMAP
+# ============================================================
+
+def save_heatmap(
+    temperature: np.ndarray,
     output_path: Path,
-    source: Path,
-) -> None:
-    rows = [
-        ("source_file", source.name),
-        ("thermal_width_px", WIDTH),
-        ("thermal_height_px", HEIGHT),
-        ("minimum_C", f"{stats['minimum_C']:.4f}"),
-        ("minimum_x_px", stats["minimum_x_px"]),
-        ("minimum_y_px", stats["minimum_y_px"]),
-        ("maximum_C", f"{stats['maximum_C']:.4f}"),
-        ("maximum_x_px", stats["maximum_x_px"]),
-        ("maximum_y_px", stats["maximum_y_px"]),
-        ("mean_C", f"{stats['mean_C']:.4f}"),
-        ("center_C", f"{stats['center_C']:.4f}"),
-        ("center_x_px", stats["center_x_px"]),
-        ("center_y_px", stats["center_y_px"]),
-    ]
+    title: str
+):
+    """
+    Save a PNG heatmap derived from the
+    temperature matrix.
+    """
 
-    with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["metric", "value"])
-        writer.writerows(rows)
-
-
-def write_heatmap(
-    matrix: np.ndarray,
-    output_path: Path,
-    title: str,
-) -> None:
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig, ax = plt.subplots(
+        figsize=(8, 6)
+    )
 
     image = ax.imshow(
-        matrix,
-        origin="upper",
-        interpolation="nearest",
+        temperature,
+        cmap="inferno",
+        interpolation="nearest"
     )
 
-    colorbar = fig.colorbar(image, ax=ax)
-    colorbar.set_label("Temperature (°C)")
-
-    max_y, max_x = np.unravel_index(np.argmax(matrix), matrix.shape)
-    min_y, min_x = np.unravel_index(np.argmin(matrix), matrix.shape)
-
-    ax.annotate(
-        f"MAX {matrix[max_y, max_x]:.1f}°C",
-        xy=(max_x, max_y),
-        xytext=(8, 8),
-        textcoords="offset points",
+    ax.set_title(
+        title
     )
 
-    ax.annotate(
-        f"MIN {matrix[min_y, min_x]:.1f}°C",
-        xy=(min_x, min_y),
-        xytext=(8, -16),
-        textcoords="offset points",
+    ax.set_xlabel(
+        "Thermal pixel X"
     )
 
-    ax.set_title(title)
-    ax.set_xlabel("Thermal pixel X")
-    ax.set_ylabel("Thermal pixel Y")
+    ax.set_ylabel(
+        "Thermal pixel Y"
+    )
+
+    colorbar = fig.colorbar(
+        image,
+        ax=ax
+    )
+
+    colorbar.set_label(
+        "Temperature (°C)"
+    )
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
+
+    fig.savefig(
+        output_path,
+        dpi=150
+    )
+
     plt.close(fig)
 
 
-def collect_input_files(input_path: Path) -> list[Path]:
-    if input_path.is_file():
-        if input_path.suffix.lower() not in {".jpg", ".jpeg"}:
-            raise ValueError("Input file must be .jpg or .jpeg.")
-        return [input_path]
+# ============================================================
+# SAVE INDIVIDUAL SUMMARY
+# ============================================================
 
-    if input_path.is_dir():
-        files = sorted(
-            p for p in input_path.iterdir()
-            if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg"}
-        )
-
-        if not files:
-            raise ValueError(
-                f"No JPG/JPEG files found in folder: {input_path}"
-            )
-
-        return files
-
-    raise ValueError(f"Input path does not exist: {input_path}")
-
-
-def create_output_dirs(output_dir: Path) -> dict:
-    dirs = {
-        "root": output_dir,
-        "temperature_csv": output_dir / "temperature_csv",
-        "heatmaps": output_dir / "heatmaps",
-        "summaries": output_dir / "summaries",
-    }
-
-    for directory in dirs.values():
-        directory.mkdir(parents=True, exist_ok=True)
-
-    return dirs
-
-
-def process_one(image_path: Path, dirs: dict) -> dict:
-    matrix = extract_temperature_matrix(image_path)
-    stats = compute_stats(matrix)
-    stem = image_path.stem
-
-    temperature_csv = (
-        dirs["temperature_csv"] / f"{stem}_temperature.csv"
-    )
-
-    heatmap_png = (
-        dirs["heatmaps"] / f"{stem}_heatmap.png"
-    )
-
-    summary_csv = (
-        dirs["summaries"] / f"{stem}_summary.csv"
-    )
-
-    write_temperature_csv(
-        matrix,
-        temperature_csv
-    )
-
-    write_heatmap(
-        matrix,
-        heatmap_png,
-        f"UTi260E Thermal Map - {image_path.name}",
-    )
-
-    write_summary_csv(
-        stats,
-        summary_csv,
-        image_path
-    )
-
-    return {
-        "source_file": image_path.name,
-        "thermal_width_px": WIDTH,
-        "thermal_height_px": HEIGHT,
-        **stats,
-        "temperature_csv": str(temperature_csv),
-        "heatmap_png": str(heatmap_png),
-        "summary_csv": str(summary_csv),
-        "status": "OK",
-        "error": "",
-    }
-
-
-def write_inspection_summary(
-    rows: list[dict],
+def save_image_summary(
+    summary: dict,
     output_path: Path
-) -> None:
+):
+    """
+    Save statistics for one thermal image.
+    """
 
-    fieldnames = [
-        "source_file",
-        "thermal_width_px",
-        "thermal_height_px",
-
-        "minimum_C",
-        "minimum_x_px",
-        "minimum_y_px",
-
-        "maximum_C",
-        "maximum_x_px",
-        "maximum_y_px",
-
-        "mean_C",
-        "center_C",
-
-        "center_x_px",
-        "center_y_px",
-
-        "temperature_csv",
-        "heatmap_png",
-        "summary_csv",
-
-        "status",
-        "error",
-    ]
+    fieldnames = list(
+        summary.keys()
+    )
 
     with output_path.open(
         "w",
         newline="",
         encoding="utf-8"
-    ) as f:
+    ) as file:
 
         writer = csv.DictWriter(
-            f,
+            file,
+            fieldnames=fieldnames
+        )
+
+        writer.writeheader()
+
+        writer.writerow(
+            summary
+        )
+
+
+# ============================================================
+# PROCESS ONE IMAGE
+# ============================================================
+
+def process_one(
+    image_path: Path,
+    dirs: dict
+):
+    """
+    Process one original UTi260E JPG.
+    """
+
+    print(
+        f"Processing {image_path.name}"
+    )
+
+    stem = image_path.stem
+
+    # --------------------------------------------------------
+    # THERMAL MATRIX
+    # --------------------------------------------------------
+
+    temperature = (
+        extract_temperature_matrix(
+            image_path
+        )
+    )
+
+    # --------------------------------------------------------
+    # STATISTICS
+    # --------------------------------------------------------
+
+    stats = calculate_statistics(
+        temperature
+    )
+
+    # --------------------------------------------------------
+    # OUTPUT PATHS
+    # --------------------------------------------------------
+
+    temperature_csv_path = (
+        dirs["temperature_csv"]
+        / f"{stem}_temperature.csv"
+    )
+
+    heatmap_path = (
+        dirs["heatmaps"]
+        / f"{stem}_heatmap.png"
+    )
+
+    summary_path = (
+        dirs["summaries"]
+        / f"{stem}_summary.csv"
+    )
+
+    # --------------------------------------------------------
+    # SAVE TEMPERATURE CSV
+    # --------------------------------------------------------
+
+    save_temperature_csv(
+        temperature,
+        temperature_csv_path
+    )
+
+    # --------------------------------------------------------
+    # SAVE HEATMAP
+    # --------------------------------------------------------
+
+    save_heatmap(
+        temperature,
+        heatmap_path,
+        image_path.name
+    )
+
+    # --------------------------------------------------------
+    # EXTRACT RGB IMAGE
+    # --------------------------------------------------------
+
+    rgb_path = save_rgb_image(
+        image_path,
+        dirs
+    )
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    row = {
+        "source_file":
+            image_path.name,
+
+        "thermal_width_px":
+            THERMAL_WIDTH,
+
+        "thermal_height_px":
+            THERMAL_HEIGHT,
+
+        "minimum_C":
+            stats["minimum_C"],
+
+        "minimum_x_px":
+            stats["minimum_x_px"],
+
+        "minimum_y_px":
+            stats["minimum_y_px"],
+
+        "maximum_C":
+            stats["maximum_C"],
+
+        "maximum_x_px":
+            stats["maximum_x_px"],
+
+        "maximum_y_px":
+            stats["maximum_y_px"],
+
+        "mean_C":
+            stats["mean_C"],
+
+        "median_C":
+            stats["median_C"],
+
+        "center_C":
+            stats["center_C"],
+
+        "delta_max_C":
+            stats["delta_max_C"],
+
+        "center_x_px":
+            stats["center_x_px"],
+
+        "center_y_px":
+            stats["center_y_px"],
+
+        "temperature_csv":
+            str(
+                temperature_csv_path
+            ),
+
+        "heatmap_png":
+            str(
+                heatmap_path
+            ),
+
+        "rgb_image":
+            str(rgb_path)
+            if rgb_path
+            else "",
+
+        "summary_csv":
+            str(summary_path),
+
+        "status":
+            "OK",
+
+        "error":
+            "",
+    }
+
+    save_image_summary(
+        row,
+        summary_path
+    )
+
+    print(
+        f"  Min:    "
+        f"{stats['minimum_C']:.2f} °C"
+    )
+
+    print(
+        f"  Max:    "
+        f"{stats['maximum_C']:.2f} °C"
+    )
+
+    print(
+        f"  Mean:   "
+        f"{stats['mean_C']:.2f} °C"
+    )
+
+    print(
+        f"  Median: "
+        f"{stats['median_C']:.2f} °C"
+    )
+
+    print(
+        f"  Center: "
+        f"{stats['center_C']:.2f} °C"
+    )
+
+    print(
+        f"  ΔT max: "
+        f"{stats['delta_max_C']:.2f} °C"
+    )
+
+    if rgb_path:
+
+        print(
+            f"  RGB:    {rgb_path.name}"
+        )
+
+    return row
+
+
+# ============================================================
+# INSPECTION SUMMARY
+# ============================================================
+
+def write_inspection_summary(
+    rows,
+    output_path: Path
+):
+    """
+    Write one CSV containing all processed images.
+    """
+
+    if not rows:
+        return
+
+    # Use union of all keys so failed and
+    # successful rows always work together.
+    fieldnames = []
+
+    for row in rows:
+
+        for key in row.keys():
+
+            if key not in fieldnames:
+                fieldnames.append(key)
+
+    with output_path.open(
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
             fieldnames=fieldnames
         )
 
         writer.writeheader()
 
         for row in rows:
-            formatted = dict(row)
-
-            for key in (
-                "minimum_C",
-                "maximum_C",
-                "mean_C",
-                "center_C",
-            ):
-                if isinstance(
-                    formatted.get(key),
-                    (float, np.floating)
-                ):
-                    formatted[key] = (
-                        f"{formatted[key]:.4f}"
-                    )
-
-            writer.writerow(formatted)
+            writer.writerow(row)
 
 
-def main() -> int:
+# ============================================================
+# PROCESS WHOLE INSPECTION
+# ============================================================
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "Process one UTi260E JPG "
-            "or every JPG in a folder."
-        )
+def process_inspection(
+    input_folder: Path,
+    output_folder: Path
+):
+    """
+    Process all UTi260E JPGs in one inspection.
+
+    This function is imported directly by app.py.
+
+    Returns:
+        list of result dictionaries
+    """
+
+    input_folder = Path(
+        input_folder
     )
 
-    parser.add_argument(
-        "input",
-        type=Path,
-        help=(
-            "Original UTi260E JPG file "
-            "or folder containing JPGs"
-        ),
+    output_folder = Path(
+        output_folder
     )
 
-    args = parser.parse_args()
-
-    input_path = (
-        args.input
-        .expanduser()
-        .resolve()
+    files = collect_input_files(
+        input_folder
     )
 
-    try:
-        files = collect_input_files(
-            input_path
-        )
-
-    except Exception as exc:
-        print(
-            f"ERROR: {exc}",
-            file=sys.stderr
-        )
-        return 1
-
-    # Output location:
-    #
-    # Single file:
-    #   same folder as the image
-    #
-    # Folder:
-    #   inside the supplied folder
-
-    # Store all results in ./outputs/
-    project_dir = Path.cwd()
-
-    if input_path.is_dir():
-        inspection_name = input_path.name
-    else:
-        inspection_name = input_path.stem
-
-    base_dir = project_dir / "outputs" / inspection_name
-
-    dirs = create_output_dirs(base_dir)
-
-    print(
-        f"Found {len(files)} image(s)."
+    dirs = create_output_dirs(
+        output_folder
     )
-
-    print(
-        f"Output folder: "
-        f"{dirs['root']}"
-    )
-
-    print()
 
     summary_rows = []
 
-    successful = 0
-    failed = 0
-
-    for index, image_path in enumerate(
-        files,
-        start=1
-    ):
-
-        print(
-            f"[{index}/{len(files)}] "
-            f"Processing {image_path.name} ..."
-        )
+    for image_path in files:
 
         try:
+
             row = process_one(
                 image_path,
                 dirs
             )
 
-            summary_rows.append(row)
-
-            successful += 1
-
-            print(
-                f"    MIN "
-                f"{row['minimum_C']:.2f} °C | "
-
-                f"MAX "
-                f"{row['maximum_C']:.2f} °C | "
-
-                f"MEAN "
-                f"{row['mean_C']:.2f} °C | "
-
-                f"CENTER "
-                f"{row['center_C']:.2f} °C"
+            summary_rows.append(
+                row
             )
 
         except Exception as exc:
 
-            failed += 1
-
-            error_message = str(exc)
-
             print(
-                f"    FAILED: "
-                f"{error_message}"
+                f"FAILED: "
+                f"{image_path.name}: "
+                f"{exc}"
             )
 
             summary_rows.append({
-
                 "source_file":
                     image_path.name,
 
-                "thermal_width_px": "",
-                "thermal_height_px": "",
+                "thermal_width_px":
+                    "",
 
-                "minimum_C": "",
-                "minimum_x_px": "",
-                "minimum_y_px": "",
+                "thermal_height_px":
+                    "",
 
-                "maximum_C": "",
-                "maximum_x_px": "",
-                "maximum_y_px": "",
+                "minimum_C":
+                    "",
 
-                "mean_C": "",
-                "center_C": "",
+                "minimum_x_px":
+                    "",
 
-                "center_x_px": "",
-                "center_y_px": "",
+                "minimum_y_px":
+                    "",
 
-                "temperature_csv": "",
-                "heatmap_png": "",
-                "summary_csv": "",
+                "maximum_C":
+                    "",
 
-                "status": "FAILED",
+                "maximum_x_px":
+                    "",
+
+                "maximum_y_px":
+                    "",
+
+                "mean_C":
+                    "",
+
+                "median_C":
+                    "",
+
+                "center_C":
+                    "",
+
+                "delta_max_C":
+                    "",
+
+                "center_x_px":
+                    "",
+
+                "center_y_px":
+                    "",
+
+                "temperature_csv":
+                    "",
+
+                "heatmap_png":
+                    "",
+
+                "rgb_image":
+                    "",
+
+                "summary_csv":
+                    "",
+
+                "status":
+                    "FAILED",
 
                 "error":
-                    error_message,
+                    str(exc),
             })
 
     inspection_summary = (
@@ -512,26 +932,124 @@ def main() -> int:
     )
 
     print()
-
     print(
-        "Processing complete."
-    )
-
-    print(
-        f"Successful: {successful}"
-    )
-
-    print(
-        f"Failed:     {failed}"
-    )
-
-    print(
-        f"Summary:    "
+        f"Inspection summary: "
         f"{inspection_summary}"
     )
 
-    return 0 if failed == 0 else 2
+    return summary_rows
 
+
+# ============================================================
+# COMMAND LINE INTERFACE
+# ============================================================
+
+def main():
+    """
+    Command line usage:
+
+        python process.py inputs/inspection1
+
+    or:
+
+        python process.py inputs/00015E.jpg
+    """
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Process original UTi260E "
+            "radiometric JPG files."
+        )
+    )
+
+    parser.add_argument(
+        "input",
+        help=(
+            "Input UTi260E JPG "
+            "or inspection folder."
+        )
+    )
+
+    args = parser.parse_args()
+
+    input_path = Path(
+        args.input
+    )
+
+    # --------------------------------------------------------
+    # OUTPUT INSPECTION NAME
+    # --------------------------------------------------------
+
+    if input_path.is_dir():
+
+        inspection_name = (
+            input_path.name
+        )
+
+    else:
+
+        inspection_name = (
+            input_path.stem
+        )
+
+    # --------------------------------------------------------
+    # CLEAN PROJECT OUTPUT STRUCTURE
+    # --------------------------------------------------------
+
+    project_dir = Path.cwd()
+
+    output_folder = (
+        project_dir
+        / "outputs"
+        / inspection_name
+    )
+
+    # --------------------------------------------------------
+    # PROCESS
+    # --------------------------------------------------------
+
+    if input_path.is_dir():
+
+        process_inspection(
+            input_path,
+            output_folder
+        )
+
+    else:
+
+        dirs = create_output_dirs(
+            output_folder
+        )
+
+        try:
+
+            row = process_one(
+                input_path,
+                dirs
+            )
+
+            write_inspection_summary(
+                [row],
+                output_folder
+                / "inspection_summary.csv"
+            )
+
+        except Exception as exc:
+
+            print(
+                f"FAILED: {exc}"
+            )
+
+            return 1
+
+    return 0
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        main()
+    )
