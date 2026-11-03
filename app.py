@@ -855,6 +855,67 @@ max_y, max_x = np.unravel_index(
     temperature.shape
 )
 
+# ============================================================
+# TEMPERATURE DISTRIBUTION
+# ============================================================
+
+st.subheader("Temperature distribution")
+
+temperature_flat = temperature.flatten()
+
+fig_hist = px.histogram(
+    x=temperature_flat,
+    nbins=50,
+    labels={
+        "x": "Temperature (°C)",
+        "y": "Thermal pixels"
+    }
+)
+
+fig_hist.update_layout(
+    width=640,
+    height=350,
+    autosize=False,
+    xaxis_title="Temperature (°C)",
+    yaxis_title="Pixel count",
+    showlegend=False,
+    margin=dict(
+        l=60,
+        r=30,
+        t=20,
+        b=50
+    )
+)
+
+# Threshold line
+fig_hist.add_vline(
+    x=analysis_threshold,
+    line_dash="dash",
+    line_color="red",
+    annotation_text=(
+        f"Threshold "
+        f"{analysis_threshold:.1f}°C"
+    ),
+    annotation_position="top"
+)
+
+# Median line
+fig_hist.add_vline(
+    x=median_temperature,
+    line_dash="dot",
+    annotation_text=(
+        f"Median "
+        f"{median_temperature:.1f}°C"
+    ),
+    annotation_position="bottom"
+)
+
+st.plotly_chart(
+    fig_hist,
+    width=640,
+    height=350
+)
+
 
 # ============================================================
 # ANALYSIS METRICS
