@@ -4,3 +4,4 @@ outputs/*
 inputs/*
 # except a sample subfolder
 !inputs/sample/
+!inputs/sample2/
