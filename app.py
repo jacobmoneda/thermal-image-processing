@@ -175,13 +175,45 @@ summary = pd.read_csv(
 
 
 # ============================================================
-# ADD POSE INFORMATION
+# POSE INFORMATION
 # ============================================================
 
-summary["pose"] = (
-    summary["source_file"]
-    .apply(get_pose)
-)
+# process.py should already assign LOW / MID / HIGH
+# using image timestamps and pose_log.csv.
+#
+# Only use filename detection as a fallback.
+
+if "pose" not in summary.columns:
+
+    summary["pose"] = (
+        summary["source_file"]
+        .apply(get_pose)
+    )
+
+else:
+
+    summary["pose"] = (
+        summary["pose"]
+        .fillna("UNKNOWN")
+        .astype(str)
+        .str.upper()
+    )
+
+    unknown_mask = (
+        summary["pose"]
+        == "UNKNOWN"
+    )
+
+    summary.loc[
+        unknown_mask,
+        "pose"
+    ] = (
+        summary.loc[
+            unknown_mask,
+            "source_file"
+        ]
+        .apply(get_pose)
+    )
 
 
 # ============================================================
@@ -539,6 +571,7 @@ with st.expander(
 
     display_columns = [
         "source_file",
+        "timestamp",
         "pose",
         "minimum_C",
         "maximum_C",
